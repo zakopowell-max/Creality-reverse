@@ -6,8 +6,12 @@ Usage:
   python3 live_feed.py              # 2D depth image only (fastest)
   python3 live_feed.py --3d         # depth image + live 3D point cloud
   python3 live_feed.py --ir         # depth image + IR stream side by side
+  python3 live_feed.py --colour     # depth + colour + RGB point cloud
   python3 live_feed.py --snapshot   # capture one PLY then view it via Open3D web
   python3 live_feed.py --max-depth 1.5
+
+Note: --colour uses rough pixel-aligned mapping (same x,y for depth+colour).
+Proper extrinsic calibration is TODO — good enough to see Rubik's cube colours.
 
 Press Q / close window to quit.
 """
@@ -26,6 +30,12 @@ DEPTH_FX, DEPTH_FY = 620.0, 620.0
 IR_DEV = '/dev/video4'
 IR_W, IR_H = 1280, 800
 IR_FRAME_SIZE = IR_W * IR_H * 10 // 8  # 1280000 bytes
+
+COLOUR_DEV = '/dev/video6'
+COLOUR_W, COLOUR_H = 640, 480
+COLOUR_FRAME_SIZE = COLOUR_W * COLOUR_H * 2  # YUYV: 2 bytes/pixel
+# Colour is 640x480, depth is 640x400 — crop 40px top+bottom to align vertically
+COLOUR_CROP_Y = (COLOUR_H - DEPTH_H) // 2   # = 40
 
 NBUF = 4
 
@@ -79,9 +89,17 @@ def _streamoff(fd):
 
 # ── Device lifecycle ─────────────────────────────────────────────────────────
 
-def _prime(device, w, h, min_frame_size):
+def _prime(device, w, h, min_frame_size, pixfmt=None):
     fd = open(device, 'rb+', buffering=0)
-    _set_fmt(fd, w, h)
+    if pixfmt is not None:
+        fmt = v4l2.v4l2_format()
+        fmt.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+        fmt.fmt.pix.width = w; fmt.fmt.pix.height = h
+        fmt.fmt.pix.pixelformat = pixfmt
+        fmt.fmt.pix.field = v4l2.V4L2_FIELD_NONE
+        fcntl.ioctl(fd, v4l2.VIDIOC_S_FMT, fmt)
+    else:
+        _set_fmt(fd, w, h)
     bufs = _alloc_buffers(fd)
     _streamon(fd)
     for _ in range(30):
@@ -100,13 +118,17 @@ def _prime(device, w, h, min_frame_size):
     fd.close()
 
 
-def prime_device(with_ir=False):
+def prime_device(with_ir=False, with_colour=False):
     print("Priming depth...", end=' ', flush=True)
     _prime(DEPTH_DEV, DEPTH_W, DEPTH_H, DEPTH_W * DEPTH_H * 10 // 8)
     print("done", end='')
     if with_ir:
         print(", IR...", end=' ', flush=True)
         _prime(IR_DEV, IR_W, IR_H, IR_FRAME_SIZE)
+        print("done", end='')
+    if with_colour:
+        print(", colour...", end=' ', flush=True)
+        _prime(COLOUR_DEV, COLOUR_W, COLOUR_H, COLOUR_FRAME_SIZE, pixfmt=v4l2.V4L2_PIX_FMT_YUYV)
         print("done", end='')
     print()
 
@@ -137,6 +159,35 @@ def decode_y10(raw, w=DEPTH_W, h=DEPTH_H):
     px[2::4] = ((b[:,2] & 0x0f) << 6) | (b[:,3] >> 2)
     px[3::4] = ((b[:,3] & 0x03) << 8) | b[:,4]
     return px[:w * h].reshape(h, w)
+
+
+def decode_yuyv(raw, w=COLOUR_W, h=COLOUR_H):
+    """YUYV packed → RGB uint8 (h, w, 3). Each 4 bytes = 2 pixels: Y0 U Y1 V."""
+    data = np.frombuffer(raw, dtype=np.uint8).reshape(h, w // 2, 4).astype(np.float32)
+    y = np.empty((h, w), dtype=np.float32)
+    y[:, 0::2] = data[:, :, 0]
+    y[:, 1::2] = data[:, :, 2]
+    u = np.repeat(data[:, :, 1], 2, axis=1) - 128.0
+    v = np.repeat(data[:, :, 3], 2, axis=1) - 128.0
+    r = np.clip(y + 1.402 * v,                      0, 255)
+    g = np.clip(y - 0.344136 * u - 0.714136 * v,    0, 255)
+    b = np.clip(y + 1.772 * u,                      0, 255)
+    return np.stack([r, g, b], axis=-1).astype(np.uint8)
+
+
+def open_colour_stream():
+    """Colour camera needs no prime — it's a standard RGB sensor."""
+    fd = open(COLOUR_DEV, 'rb+', buffering=0)
+    fmt = v4l2.v4l2_format()
+    fmt.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+    fmt.fmt.pix.width = COLOUR_W
+    fmt.fmt.pix.height = COLOUR_H
+    fmt.fmt.pix.pixelformat = v4l2.V4L2_PIX_FMT_YUYV
+    fmt.fmt.pix.field = v4l2.V4L2_FIELD_NONE
+    fcntl.ioctl(fd, v4l2.VIDIOC_S_FMT, fmt)
+    bufs = _alloc_buffers(fd)
+    _streamon(fd)
+    return fd, bufs
 
 
 def depth_to_points(depth_img, min_m=0.05, max_m=5.0, max_pts=6000):
@@ -195,6 +246,8 @@ def main():
                         help='Show live 3D point cloud alongside depth image')
     parser.add_argument('--ir', action='store_true',
                         help='Show IR stream alongside depth image')
+    parser.add_argument('--colour', action='store_true',
+                        help='Show colour camera + RGB-coloured point cloud')
     parser.add_argument('--snapshot', action='store_true',
                         help='Capture one frame, save PLY, view in browser')
     parser.add_argument('--max-depth', type=float, default=2.0,
@@ -202,14 +255,15 @@ def main():
     args = parser.parse_args()
     max_raw = int(args.max_depth / DEPTH_SCALE)
 
-    prime_device(with_ir=args.ir)
+    prime_device(with_ir=args.ir, with_colour=args.colour)
 
     if args.snapshot:
         do_snapshot(args.max_depth)
         return
 
     depth_fd, depth_bufs = open_stream(DEPTH_DEV, DEPTH_W, DEPTH_H)
-    ir_fd, ir_bufs = (open_stream(IR_DEV, IR_W, IR_H) if args.ir else (None, None))
+    ir_fd,    ir_bufs    = (open_stream(IR_DEV, IR_W, IR_H) if args.ir else (None, None))
+    col_fd,   col_bufs   = (open_colour_stream() if args.colour else (None, None))
 
     # Skip warm-up empty frames on depth stream
     skipped = 0
@@ -228,12 +282,12 @@ def main():
             break
         fcntl.ioctl(depth_fd, v4l2.VIDIOC_QBUF, b)
         skipped += 1
-    mode_str = " (+IR)" if args.ir else (" (+3D)" if args.show3d else "")
+    mode_str = " (+IR)" if args.ir else (" (+colour)" if args.colour else (" (+3D)" if args.show3d else ""))
     print(f"Skipped {skipped} warm-up frames. Live feed{mode_str} — close window or Ctrl-C to quit.")
 
     # ── Figure layout ────────────────────────────────────────────────────────
     plt.ion()
-    n_panels = 1 + bool(args.show3d) + bool(args.ir)
+    n_panels = 1 + bool(args.show3d) + bool(args.ir) + bool(args.colour)
     fig = plt.figure(figsize=(10 * n_panels // 1, 5) if n_panels > 1 else (10, 6.25),
                      facecolor='#111')
 
@@ -267,7 +321,19 @@ def main():
         im_ir = ax_ir.imshow(blank_ir, cmap='gray', vmin=0, vmax=1023,
                              interpolation='nearest', aspect='auto')
 
-    # 3D panel
+    # Colour panel
+    ax_col = im_col = None
+    latest_colour = [None]   # shared between capture and 3D scatter
+    if args.colour:
+        panel_idx = 2 + bool(args.ir)
+        ax_col = fig.add_subplot(1, n_panels, panel_idx)
+        ax_col.set_facecolor('#111')
+        ax_col.axis('off')
+        ax_col.set_title('Colour  (rough align)', color='white', fontsize=9)
+        blank_col = np.zeros((DEPTH_H, COLOUR_W, 3), dtype=np.uint8)
+        im_col = ax_col.imshow(blank_col, interpolation='nearest', aspect='auto')
+
+    # 3D panel (always last)
     ax3d = scat3d = None
     if args.show3d:
         ax3d = fig.add_subplot(1, n_panels, n_panels, projection='3d')
@@ -295,8 +361,8 @@ def main():
 
     try:
         while running[0]:
-            # Poll both streams with a short timeout
-            fds = [depth_fd] + ([ir_fd] if ir_fd else [])
+            # Poll all active streams
+            fds = [depth_fd] + ([ir_fd] if ir_fd else []) + ([col_fd] if col_fd else [])
             r, _, _ = select.select(fds, [], [], 0.05)
             if not r:
                 fig.canvas.flush_events()
@@ -334,15 +400,64 @@ def main():
                         if len(pts):
                             if scat3d is not None:
                                 scat3d.remove()
-                            z = pts[:, 2]
-                            t = np.clip((z - 0.05) / (args.max_depth - 0.05), 0, 1)
-                            import matplotlib.cm as cmx
+                            # Use real colour if available, else plasma depth colourmap
+                            if args.colour and latest_colour[0] is not None:
+                                col_img = latest_colour[0]  # (DEPTH_H, COLOUR_W, 3)
+                                cx_px = DEPTH_W / 2
+                                cy_px = DEPTH_H / 2
+                                h, w = depth.shape
+                                ys, xs = np.mgrid[0:h, 0:w]
+                                Z = depth * DEPTH_SCALE
+                                valid = (Z > 0.05) & (Z < args.max_depth)
+                                vx = xs[valid]; vy = ys[valid]
+                                # Sample colour at same pixel (rough alignment)
+                                # col_img is 640x400 so col_x = vx, col_y = vy
+                                col_x = np.clip(vx, 0, COLOUR_W - 1)
+                                col_y = np.clip(vy, 0, DEPTH_H - 1)
+                                pt_colours = col_img[col_y, col_x].astype(float) / 255.0
+                                if len(pt_colours) > 6000:
+                                    idx = np.random.choice(len(pt_colours), 6000, replace=False)
+                                    pts = pts[idx] if len(pts) > 6000 else pts
+                                    # Re-derive pts for consistency
+                                    X = (vx[idx] - cx_px) * Z[valid][idx] / DEPTH_FX
+                                    Y = (vy[idx] - cy_px) * Z[valid][idx] / DEPTH_FY
+                                    pts = np.column_stack([X, Y, Z[valid][idx]])
+                                    pt_colours = pt_colours[idx]
+                                colours = pt_colours
+                            else:
+                                z = pts[:, 2]
+                                t = np.clip((z - 0.05) / (args.max_depth - 0.05), 0, 1)
+                                import matplotlib.cm as cmx
+                                colours = cmx.plasma(t)
                             scat3d = ax3d.scatter(pts[:,0], pts[:,2], -pts[:,1],
-                                                  c=cmx.plasma(t), s=0.5, alpha=0.6,
+                                                  c=colours, s=0.5, alpha=0.8,
                                                   depthshade=False)
                             ax3d.set_xlim(-1, 1); ax3d.set_ylim(0, args.max_depth); ax3d.set_zlim(-0.5, 0.5)
                 else:
                     fcntl.ioctl(depth_fd, v4l2.VIDIOC_QBUF, b)
+
+            # ── Colour frame ─────────────────────────────────────────────────
+            if col_fd and col_fd in r:
+                b = v4l2.v4l2_buffer()
+                b.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+                b.memory = v4l2.V4L2_MEMORY_MMAP
+                fcntl.ioctl(col_fd, v4l2.VIDIOC_DQBUF, b)
+                if b.bytesused >= COLOUR_FRAME_SIZE:
+                    raw_col = bytes(col_bufs[b.index][:COLOUR_FRAME_SIZE])
+                    fcntl.ioctl(col_fd, v4l2.VIDIOC_QBUF, b)
+                    rgb = decode_yuyv(raw_col)
+                    # Centre-crop vertically: 640x480 → 640x400
+                    cropped = rgb[COLOUR_CROP_Y:COLOUR_CROP_Y + DEPTH_H, :, :]
+                    # Brightness boost: stretch max pixel → 240 to cope with dark room
+                    f = cropped.astype(np.float32)
+                    peak = np.percentile(f, 99.5)
+                    gain = (240.0 / peak) if peak > 1 else 1.0
+                    boosted = np.clip(f * gain, 0, 255).astype(np.uint8)
+                    latest_colour[0] = boosted
+                    im_col.set_data(boosted)
+                    fig.canvas.draw()  # colour frames are rare (~1fps), force full redraw
+                else:
+                    fcntl.ioctl(col_fd, v4l2.VIDIOC_QBUF, b)
 
             # ── IR frame ─────────────────────────────────────────────────────
             if ir_fd and ir_fd in r:
@@ -369,6 +484,8 @@ def main():
         close_stream(depth_fd, depth_bufs)
         if ir_fd:
             close_stream(ir_fd, ir_bufs)
+        if col_fd:
+            close_stream(col_fd, col_bufs)
         plt.close(fig)
         print("Stream closed.")
 
