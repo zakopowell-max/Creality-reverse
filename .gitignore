@@ -1,0 +1,18 @@
+# Large binaries
+*.pkg
+*.exe
+*.zip
+*.tar.gz
+
+# Extracted installer dirs
+extracted/
+mac_app/
+mac_out/
+orbbec_sdk_linux/
+log/
+
+# Scan output
+*.ply
+*.pgm
+*.png
+/tmp/
