@@ -5,6 +5,7 @@ Live depth feed from Creality CR-Scan Otter — GTK3Agg display (Wayland-safe).
 Usage:
   python3 live_feed.py              # 2D depth image only (fastest)
   python3 live_feed.py --3d         # depth image + live 3D point cloud
+  python3 live_feed.py --ir         # depth image + IR stream side by side
   python3 live_feed.py --snapshot   # capture one PLY then view it via Open3D web
   python3 live_feed.py --max-depth 1.5
 
@@ -21,16 +22,21 @@ DEPTH_DEV = '/dev/video2'
 DEPTH_W, DEPTH_H = 640, 400
 DEPTH_SCALE = 0.005   # m/unit, calibrated 2026-04-03
 DEPTH_FX, DEPTH_FY = 620.0, 620.0
+
+IR_DEV = '/dev/video4'
+IR_W, IR_H = 1280, 800
+IR_FRAME_SIZE = IR_W * IR_H * 10 // 8  # 1280000 bytes
+
 NBUF = 4
 
 
 # ── V4L2 helpers ─────────────────────────────────────────────────────────────
 
-def _set_fmt(fd):
+def _set_fmt(fd, w, h):
     fmt = v4l2.v4l2_format()
     fmt.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-    fmt.fmt.pix.width = DEPTH_W
-    fmt.fmt.pix.height = DEPTH_H
+    fmt.fmt.pix.width = w
+    fmt.fmt.pix.height = h
     fmt.fmt.pix.pixelformat = v4l2.V4L2_PIX_FMT_Y10
     fmt.fmt.pix.field = v4l2.V4L2_FIELD_NONE
     fcntl.ioctl(fd, v4l2.VIDIOC_S_FMT, fmt)
@@ -73,10 +79,9 @@ def _streamoff(fd):
 
 # ── Device lifecycle ─────────────────────────────────────────────────────────
 
-def prime_device():
-    print("Priming scanner...", end=' ', flush=True)
-    fd = open(DEPTH_DEV, 'rb+', buffering=0)
-    _set_fmt(fd)
+def _prime(device, w, h, min_frame_size):
+    fd = open(device, 'rb+', buffering=0)
+    _set_fmt(fd, w, h)
     bufs = _alloc_buffers(fd)
     _streamon(fd)
     for _ in range(30):
@@ -88,17 +93,27 @@ def prime_device():
         b.memory = v4l2.V4L2_MEMORY_MMAP
         fcntl.ioctl(fd, v4l2.VIDIOC_DQBUF, b)
         fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
-        if b.bytesused >= 320000:
+        if b.bytesused >= min_frame_size:
             break
     _streamoff(fd)
     _free_buffers(fd, bufs)
     fd.close()
-    print("done")
 
 
-def open_stream():
-    fd = open(DEPTH_DEV, 'rb+', buffering=0)
-    _set_fmt(fd)
+def prime_device(with_ir=False):
+    print("Priming depth...", end=' ', flush=True)
+    _prime(DEPTH_DEV, DEPTH_W, DEPTH_H, DEPTH_W * DEPTH_H * 10 // 8)
+    print("done", end='')
+    if with_ir:
+        print(", IR...", end=' ', flush=True)
+        _prime(IR_DEV, IR_W, IR_H, IR_FRAME_SIZE)
+        print("done", end='')
+    print()
+
+
+def open_stream(device, w, h):
+    fd = open(device, 'rb+', buffering=0)
+    _set_fmt(fd, w, h)
     bufs = _alloc_buffers(fd)
     _streamon(fd)
     return fd, bufs
@@ -148,7 +163,7 @@ def do_snapshot(max_m):
                                    depth_to_pointcloud, save_ply)
     import open3d as o3d
 
-    fd, bufs = open_stream()
+    fd, bufs = open_stream(DEPTH_DEV, DEPTH_W, DEPTH_H)
     raw_frames = capture_frames(fd, bufs, 5)
     close_stream(fd, bufs)
 
@@ -178,6 +193,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--3d', action='store_true', dest='show3d',
                         help='Show live 3D point cloud alongside depth image')
+    parser.add_argument('--ir', action='store_true',
+                        help='Show IR stream alongside depth image')
     parser.add_argument('--snapshot', action='store_true',
                         help='Capture one frame, save PLY, view in browser')
     parser.add_argument('--max-depth', type=float, default=2.0,
@@ -185,57 +202,51 @@ def main():
     args = parser.parse_args()
     max_raw = int(args.max_depth / DEPTH_SCALE)
 
-    prime_device()
+    prime_device(with_ir=args.ir)
 
     if args.snapshot:
         do_snapshot(args.max_depth)
         return
 
-    fd, bufs = open_stream()
+    depth_fd, depth_bufs = open_stream(DEPTH_DEV, DEPTH_W, DEPTH_H)
+    ir_fd, ir_bufs = (open_stream(IR_DEV, IR_W, IR_H) if args.ir else (None, None))
 
-    # Skip warm-up empty frames
+    # Skip warm-up empty frames on depth stream
     skipped = 0
     while True:
-        r, _, _ = select.select([fd], [], [], 5.0)
+        r, _, _ = select.select([depth_fd], [], [], 5.0)
         if not r:
             print("ERROR: no frames from device")
-            close_stream(fd, bufs)
+            close_stream(depth_fd, depth_bufs)
             sys.exit(1)
         b = v4l2.v4l2_buffer()
         b.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
         b.memory = v4l2.V4L2_MEMORY_MMAP
-        fcntl.ioctl(fd, v4l2.VIDIOC_DQBUF, b)
-        if b.bytesused >= 320000:
-            fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
+        fcntl.ioctl(depth_fd, v4l2.VIDIOC_DQBUF, b)
+        if b.bytesused >= DEPTH_W * DEPTH_H * 10 // 8:
+            fcntl.ioctl(depth_fd, v4l2.VIDIOC_QBUF, b)
             break
-        fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
+        fcntl.ioctl(depth_fd, v4l2.VIDIOC_QBUF, b)
         skipped += 1
-    print(f"Skipped {skipped} warm-up frames. Live feed — close window or Ctrl-C to quit.")
+    mode_str = " (+IR)" if args.ir else (" (+3D)" if args.show3d else "")
+    print(f"Skipped {skipped} warm-up frames. Live feed{mode_str} — close window or Ctrl-C to quit.")
 
     # ── Figure layout ────────────────────────────────────────────────────────
     plt.ion()
-    if args.show3d:
-        fig = plt.figure(figsize=(14, 5), facecolor='#111')
-        ax2d = fig.add_subplot(1, 2, 1)
-        ax3d = fig.add_subplot(1, 2, 2, projection='3d')
-        ax3d.set_facecolor('#111')
-        ax3d.set_xlabel('X', color='#888', fontsize=8)
-        ax3d.set_ylabel('Z (depth)', color='#888', fontsize=8)
-        ax3d.set_zlabel('Y', color='#888', fontsize=8)
-        ax3d.tick_params(colors='#555', labelsize=7)
-        for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
-            pane.fill = False
-            pane.set_edgecolor('#333')
-        scat3d = None
+    n_panels = 1 + bool(args.show3d) + bool(args.ir)
+    fig = plt.figure(figsize=(10 * n_panels // 1, 5) if n_panels > 1 else (10, 6.25),
+                     facecolor='#111')
+
+    if n_panels == 1:
+        ax2d = fig.add_subplot(1, 1, 1)
     else:
-        fig, ax2d = plt.subplots(figsize=(10, 6.25))
-        fig.patch.set_facecolor('#111')
+        ax2d = fig.add_subplot(1, n_panels, 1)
 
     ax2d.set_facecolor('#111')
     ax2d.axis('off')
 
-    blank = np.zeros((DEPTH_H, DEPTH_W), dtype=np.float32)
-    im = ax2d.imshow(blank, cmap='plasma', vmin=0, vmax=max_raw,
+    blank_d = np.zeros((DEPTH_H, DEPTH_W), dtype=np.float32)
+    im = ax2d.imshow(blank_d, cmap='plasma', vmin=0, vmax=max_raw,
                      interpolation='nearest', aspect='auto')
     cbar = fig.colorbar(im, ax=ax2d, fraction=0.025, pad=0.01)
     cbar.set_label('Depth (m)', color='white')
@@ -243,8 +254,33 @@ def main():
     cbar.set_ticks(tick_vals)
     cbar.set_ticklabels([f'{v*DEPTH_SCALE:.1f}m' for v in tick_vals])
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+    ax2d.set_title('Depth', color='white', fontsize=9)
 
-    title = ax2d.set_title('Starting...', color='white', fontsize=10)
+    # IR panel
+    ax_ir = im_ir = None
+    if args.ir:
+        ax_ir = fig.add_subplot(1, n_panels, 2)
+        ax_ir.set_facecolor('#111')
+        ax_ir.axis('off')
+        ax_ir.set_title('IR  (1280×800)', color='white', fontsize=9)
+        blank_ir = np.zeros((IR_H, IR_W), dtype=np.float32)
+        im_ir = ax_ir.imshow(blank_ir, cmap='gray', vmin=0, vmax=1023,
+                             interpolation='nearest', aspect='auto')
+
+    # 3D panel
+    ax3d = scat3d = None
+    if args.show3d:
+        ax3d = fig.add_subplot(1, n_panels, n_panels, projection='3d')
+        ax3d.set_facecolor('#111')
+        ax3d.set_xlabel('X', color='#888', fontsize=8)
+        ax3d.set_ylabel('Z', color='#888', fontsize=8)
+        ax3d.set_zlabel('Y', color='#888', fontsize=8)
+        ax3d.tick_params(colors='#555', labelsize=7)
+        for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
+            pane.fill = False
+            pane.set_edgecolor('#333')
+
+    title = fig.suptitle('Starting...', color='white', fontsize=10)
     plt.tight_layout(pad=0.5)
     fig.canvas.draw()
     fig.canvas.flush_events()
@@ -252,7 +288,6 @@ def main():
     running = [True]
     fig.canvas.mpl_connect('close_event', lambda _: running.__setitem__(0, False))
 
-    # For 3D: only redraw every N depth frames (matplotlib 3D is slow)
     cloud_every = 5
     cloud_counter = 0
     frame_count = 0
@@ -260,74 +295,80 @@ def main():
 
     try:
         while running[0]:
-            r, _, _ = select.select([fd], [], [], 0.1)
+            # Poll both streams with a short timeout
+            fds = [depth_fd] + ([ir_fd] if ir_fd else [])
+            r, _, _ = select.select(fds, [], [], 0.05)
             if not r:
                 fig.canvas.flush_events()
                 continue
 
-            b = v4l2.v4l2_buffer()
-            b.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-            b.memory = v4l2.V4L2_MEMORY_MMAP
-            fcntl.ioctl(fd, v4l2.VIDIOC_DQBUF, b)
+            # ── Depth frame ──────────────────────────────────────────────────
+            if depth_fd in r:
+                b = v4l2.v4l2_buffer()
+                b.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+                b.memory = v4l2.V4L2_MEMORY_MMAP
+                fcntl.ioctl(depth_fd, v4l2.VIDIOC_DQBUF, b)
+                depth_frame_size = DEPTH_W * DEPTH_H * 10 // 8
+                if b.bytesused >= depth_frame_size:
+                    raw = bytes(depth_bufs[b.index][:depth_frame_size])
+                    fcntl.ioctl(depth_fd, v4l2.VIDIOC_QBUF, b)
+                    depth = decode_y10(raw, DEPTH_W, DEPTH_H).astype(np.float32)
+                    depth[depth > max_raw] = 0
+                    frame_count += 1
+                    cloud_counter += 1
+                    im.set_data(depth)
 
-            if b.bytesused < 320000:
-                fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
-                fig.canvas.flush_events()
-                continue
+                    now = time.time()
+                    if now - fps_t >= 1.5:
+                        fps = frame_count / (now - fps_t)
+                        frame_count = 0; fps_t = now
+                        cy = slice(DEPTH_H//2-10, DEPTH_H//2+10)
+                        cx = slice(DEPTH_W//2-16, DEPTH_W//2+16)
+                        cnz = depth[cy, cx]; cnz = cnz[cnz > 0]
+                        cdist = f"{cnz.mean()*DEPTH_SCALE*100:.0f}cm" if len(cnz) else "no-return"
+                        title.set_text(f'{fps:.1f} fps{mode_str}  |  centre {cdist}  |  close to quit')
 
-            raw = bytes(bufs[b.index][:320000])
-            fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
+                    if args.show3d and cloud_counter >= cloud_every:
+                        cloud_counter = 0
+                        pts = depth_to_points(depth, max_m=args.max_depth)
+                        if len(pts):
+                            if scat3d is not None:
+                                scat3d.remove()
+                            z = pts[:, 2]
+                            t = np.clip((z - 0.05) / (args.max_depth - 0.05), 0, 1)
+                            import matplotlib.cm as cmx
+                            scat3d = ax3d.scatter(pts[:,0], pts[:,2], -pts[:,1],
+                                                  c=cmx.plasma(t), s=0.5, alpha=0.6,
+                                                  depthshade=False)
+                            ax3d.set_xlim(-1, 1); ax3d.set_ylim(0, args.max_depth); ax3d.set_zlim(-0.5, 0.5)
+                else:
+                    fcntl.ioctl(depth_fd, v4l2.VIDIOC_QBUF, b)
 
-            depth = decode_y10(raw).astype(np.float32)
-            depth[depth > max_raw] = 0
-            frame_count += 1
-            cloud_counter += 1
+            # ── IR frame ─────────────────────────────────────────────────────
+            if ir_fd and ir_fd in r:
+                b = v4l2.v4l2_buffer()
+                b.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+                b.memory = v4l2.V4L2_MEMORY_MMAP
+                fcntl.ioctl(ir_fd, v4l2.VIDIOC_DQBUF, b)
+                if b.bytesused >= IR_FRAME_SIZE:
+                    raw_ir = bytes(ir_bufs[b.index][:IR_FRAME_SIZE])
+                    fcntl.ioctl(ir_fd, v4l2.VIDIOC_QBUF, b)
+                    ir_img = decode_y10(raw_ir, IR_W, IR_H).astype(np.float32)
+                    p99 = np.percentile(ir_img[ir_img > 0], 99) if np.any(ir_img > 0) else 1
+                    im_ir.set_clim(vmin=0, vmax=max(p99, 1))
+                    im_ir.set_data(ir_img)
+                else:
+                    fcntl.ioctl(ir_fd, v4l2.VIDIOC_QBUF, b)
 
-            # ── 2D depth update ──────────────────────────────────────────────
-            im.set_data(depth)
-
-            now = time.time()
-            if now - fps_t >= 1.5:
-                fps = frame_count / (now - fps_t)
-                frame_count = 0
-                fps_t = now
-                cy = slice(DEPTH_H//2-10, DEPTH_H//2+10)
-                cx = slice(DEPTH_W//2-16, DEPTH_W//2+16)
-                cnz = depth[cy, cx]
-                cnz = cnz[cnz > 0]
-                cdist = f"{cnz.mean()*DEPTH_SCALE*100:.0f}cm" if len(cnz) else "no-return"
-                mode = " (+3D)" if args.show3d else ""
-                title.set_text(f'{fps:.1f} fps{mode}  |  centre {cdist}  |  close to quit')
-
-            # ── 3D point cloud update (every N frames) ───────────────────────
-            if args.show3d and cloud_counter >= cloud_every:
-                cloud_counter = 0
-                pts = depth_to_points(depth, max_m=args.max_depth)
-                if len(pts):
-                    if scat3d is not None:
-                        scat3d.remove()
-                    z = pts[:, 2]
-                    t = np.clip((z - 0.05) / (args.max_depth - 0.05), 0, 1)
-                    import matplotlib.cm as cmx
-                    colours = cmx.plasma(t)
-                    # matplotlib 3D: X=left/right, Y=depth, Z=up/down
-                    scat3d = ax3d.scatter(pts[:,0], pts[:,2], -pts[:,1],
-                                         c=colours, s=0.5, alpha=0.6,
-                                         depthshade=False)
-                    ax3d.set_xlim(-1, 1)
-                    ax3d.set_ylim(0, args.max_depth)
-                    ax3d.set_zlim(-0.5, 0.5)
-                fig.canvas.draw()
-            else:
-                # Fast blit for 2D-only frames
-                fig.canvas.draw_idle()
-
+            fig.canvas.draw_idle()
             fig.canvas.flush_events()
 
     except KeyboardInterrupt:
         pass
     finally:
-        close_stream(fd, bufs)
+        close_stream(depth_fd, depth_bufs)
+        if ir_fd:
+            close_stream(ir_fd, ir_bufs)
         plt.close(fig)
         print("Stream closed.")
 
