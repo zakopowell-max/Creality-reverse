@@ -103,25 +103,31 @@ def open_stream(device, width, height, pixfmt, nbuf=4):
     return fd, buffers, (actual_w, actual_h)
 
 
-def capture_frame(fd, buffers, timeout=5.0):
-    for _ in range(200):
-        r, _, _ = select.select([fd], [], [], timeout)
+def capture_frames(fd, buffers, count, frame_size=320000, timeout=30.0):
+    """Capture `count` non-empty frames in a single tight polling loop.
+    Device delivers frames in a burst — interleaving processing between calls misses it."""
+    frames = []
+    skipped = 0
+    deadline = time.time() + timeout
+    while len(frames) < count and time.time() < deadline:
+        remaining = deadline - time.time()
+        r, _, _ = select.select([fd], [], [], min(remaining, 5.0))
         if not r:
-            return None
+            print(f"  (timeout waiting for frame, got {len(frames)}/{count})")
+            break
         buf = v4l2.v4l2_buffer()
         buf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
         buf.memory = v4l2.V4L2_MEMORY_MMAP
         fcntl.ioctl(fd, v4l2.VIDIOC_DQBUF, buf)
-        raw = bytes(buffers[buf.index][:buf.bytesused])
-        # Also read full mmap — kernel may deliver data with bytesused=0 (driver quirk)
-        raw_full = bytes(buffers[buf.index][:320000])
+        if buf.bytesused >= frame_size:
+            raw = bytes(buffers[buf.index][:frame_size])
+            frames.append(raw)
+        else:
+            skipped += 1
         fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, buf)
-        if buf.bytesused > 100000:
-            return raw
-        if any(raw_full[i] for i in range(0, 320, 5)):  # sample every 5th byte in first 320
-            return raw_full
-        print(f"  (skip frame idx={buf.index} bytesused={buf.bytesused})")
-    return None
+    if skipped:
+        print(f"  (skipped {skipped} empty frames)")
+    return frames
 
 
 def close_stream(fd):
@@ -183,19 +189,22 @@ def main():
     fd_d, bufs_d, (dw, dh) = open_stream(DEPTH_DEV, DEPTH_W, DEPTH_H, v4l2.V4L2_PIX_FMT_Y10)
     print(f"  {dw}x{dh}, scale={args.scale} m/unit → max range {1023*args.scale:.1f}m")
 
-    print(f"Capturing {args.frames} depth frames (skipping initial empty frames)...")
+    print(f"Capturing {args.frames} depth frames in tight burst loop...")
+    raw_frames = capture_frames(fd_d, bufs_d, args.frames)
+    close_stream(fd_d)
+
     depth_sum = np.zeros((dh, dw), dtype=np.float32)
     valid_count = 0
-    for i in range(args.frames):
-        raw = capture_frame(fd_d, bufs_d)
-        if raw:
-            d = decode_y10_packed(raw, dw, dh).astype(np.float32)
-            depth_sum += d
-            valid_count += 1
-            nz = d[d > 0]
-            print(f"  Frame {i}: mean={nz.mean():.1f} ({nz.mean()*args.scale*100:.0f}cm), nonzero={len(nz)}")
-
-    close_stream(fd_d)
+    for i, raw in enumerate(raw_frames):
+        d = decode_y10_packed(raw, dw, dh).astype(np.float32)
+        depth_sum += d
+        valid_count += 1
+        min_raw = args.min_depth / args.scale
+        valid = d[d >= min_raw]
+        center = d[dh//2-20:dh//2+20, dw//2-32:dw//2+32]
+        cnz = center[center >= min_raw]
+        center_str = f" center={cnz.mean():.1f}raw({cnz.mean()*args.scale*100:.0f}cm)" if len(cnz) else " center=no-data"
+        print(f"  Frame {i}: valid={len(valid)} mean={valid.mean():.1f}raw({valid.mean()*args.scale*100:.0f}cm){center_str}")
 
     if valid_count == 0:
         print("ERROR: No valid depth frames!")
