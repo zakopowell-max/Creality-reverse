@@ -22,28 +22,13 @@ DEPTH_CY = DEPTH_H / 2
 DEPTH_SCALE = 0.005  # calibrated: 58.6 units = 30cm (2026-04-03)
 
 
-def open_stream(device, width, height, pixfmt, nbuf=4):
-    fd = open(device, 'rb+', buffering=0)
-    fmt = v4l2.v4l2_format()
-    fmt.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-    fmt.fmt.pix.width = width
-    fmt.fmt.pix.height = height
-    fmt.fmt.pix.pixelformat = pixfmt
-    fmt.fmt.pix.field = v4l2.V4L2_FIELD_NONE
-    fcntl.ioctl(fd, v4l2.VIDIOC_S_FMT, fmt)
-    actual_w = fmt.fmt.pix.width
-    actual_h = fmt.fmt.pix.height
-    pf = fmt.fmt.pix.pixelformat
-    fourcc = ''.join(chr((pf >> i*8) & 0xff) for i in range(4))
-    print(f"  S_FMT result: {actual_w}x{actual_h} fmt=0x{pf:08x}({fourcc!r}) bpl={fmt.fmt.pix.bytesperline} sizeimage={fmt.fmt.pix.sizeimage}")
-
+def _setup_buffers(fd, nbuf):
+    """Allocate and mmap V4L2 buffers, queue them. Returns (buffers, count)."""
     reqbufs = v4l2.v4l2_requestbuffers()
     reqbufs.count = nbuf
     reqbufs.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
     reqbufs.memory = v4l2.V4L2_MEMORY_MMAP
     fcntl.ioctl(fd, v4l2.VIDIOC_REQBUFS, reqbufs)
-    print(f"  REQBUFS allocated: {reqbufs.count} buffers")
-
     buffers = []
     for i in range(reqbufs.count):
         buf = v4l2.v4l2_buffer()
@@ -54,62 +39,66 @@ def open_stream(device, width, height, pixfmt, nbuf=4):
         mm = mmap.mmap(fd.fileno(), buf.length, offset=buf.m.offset)
         buffers.append(mm)
         fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, buf)
+    return buffers, reqbufs.count
 
-    # Two-phase prime: device needs one full streaming cycle before bytesused is set correctly.
-    # Phase 1: wake device up (bytesused=0 always on first open, use mmap check)
-    print("  Priming scanner (phase 1: wake up)...")
-    fcntl.ioctl(fd, v4l2.VIDIOC_STREAMON, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
-    p1_end = time.time() + 5.0
-    while time.time() < p1_end:
-        r, _, _ = select.select([fd], [], [], 1.0)
-        if not r:
-            break
-        pbuf = v4l2.v4l2_buffer()
-        pbuf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-        pbuf.memory = v4l2.V4L2_MEMORY_MMAP
-        fcntl.ioctl(fd, v4l2.VIDIOC_DQBUF, pbuf)
-        raw_mm = bytes(buffers[pbuf.index][:320000])
-        fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, pbuf)
-        if any(raw_mm[i] for i in range(0, 320, 5)):
-            break
-    fcntl.ioctl(fd, v4l2.VIDIOC_STREAMOFF, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
 
-    # Phase 2: device is awake — now bytesused should work properly
-    print("  Priming scanner (phase 2: wait for proper frames)...")
-    for i in range(reqbufs.count):
-        buf = v4l2.v4l2_buffer()
-        buf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-        buf.memory = v4l2.V4L2_MEMORY_MMAP
-        buf.index = i
-        fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, buf)
-    fcntl.ioctl(fd, v4l2.VIDIOC_STREAMON, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
-    p2_end = time.time() + 5.0
-    got_real = False
-    while time.time() < p2_end:
-        r, _, _ = select.select([fd], [], [], 1.0)
-        if not r:
-            break
-        pbuf = v4l2.v4l2_buffer()
-        pbuf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-        pbuf.memory = v4l2.V4L2_MEMORY_MMAP
-        fcntl.ioctl(fd, v4l2.VIDIOC_DQBUF, pbuf)
-        fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, pbuf)
-        if pbuf.bytesused >= 320000:
-            got_real = True
-            break
-    print(f"  Prime done (got_real={got_real})")
-    fcntl.ioctl(fd, v4l2.VIDIOC_STREAMOFF, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
-
-    # Zero mmaps and re-queue for the real capture
+def _release_buffers(fd, buffers):
+    """Close mmaps and release kernel buffers."""
     for mm in buffers:
-        mm.seek(0)
-        mm.write(b'\x00' * len(mm))
-    for i in range(reqbufs.count):
-        buf = v4l2.v4l2_buffer()
-        buf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
-        buf.memory = v4l2.V4L2_MEMORY_MMAP
-        buf.index = i
-        fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, buf)
+        mm.close()
+    reqbufs = v4l2.v4l2_requestbuffers()
+    reqbufs.count = 0
+    reqbufs.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+    reqbufs.memory = v4l2.V4L2_MEMORY_MMAP
+    fcntl.ioctl(fd, v4l2.VIDIOC_REQBUFS, reqbufs)
+
+
+def open_stream(device, width, height, pixfmt, nbuf=4):
+    def _set_fmt(fd):
+        fmt = v4l2.v4l2_format()
+        fmt.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+        fmt.fmt.pix.width = width
+        fmt.fmt.pix.height = height
+        fmt.fmt.pix.pixelformat = pixfmt
+        fmt.fmt.pix.field = v4l2.V4L2_FIELD_NONE
+        fcntl.ioctl(fd, v4l2.VIDIOC_S_FMT, fmt)
+        return fmt
+
+    # --- Prime pass: first open, wakes the device up ---
+    # On cold start bytesused is always 0; device needs one full open/stream/close
+    # cycle before it delivers properly-signalled frames on the next open.
+    print("  Priming scanner...")
+    fd_p = open(device, 'rb+', buffering=0)
+    _set_fmt(fd_p)
+    bufs_p, _ = _setup_buffers(fd_p, nbuf)
+    fcntl.ioctl(fd_p, v4l2.VIDIOC_STREAMON, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        r, _, _ = select.select([fd_p], [], [], 1.0)
+        if not r:
+            break
+        pbuf = v4l2.v4l2_buffer()
+        pbuf.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE
+        pbuf.memory = v4l2.V4L2_MEMORY_MMAP
+        fcntl.ioctl(fd_p, v4l2.VIDIOC_DQBUF, pbuf)
+        raw_mm = bytes(bufs_p[pbuf.index][:320000])
+        fcntl.ioctl(fd_p, v4l2.VIDIOC_QBUF, pbuf)
+        if any(raw_mm[i] for i in range(0, 320, 5)):
+            break  # device is awake
+    fcntl.ioctl(fd_p, v4l2.VIDIOC_STREAMOFF, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
+    _release_buffers(fd_p, bufs_p)
+    fd_p.close()
+
+    # --- Real open: device now delivers proper frames ---
+    fd = open(device, 'rb+', buffering=0)
+    fmt = _set_fmt(fd)
+    actual_w = fmt.fmt.pix.width
+    actual_h = fmt.fmt.pix.height
+    pf = fmt.fmt.pix.pixelformat
+    fourcc = ''.join(chr((pf >> i*8) & 0xff) for i in range(4))
+    print(f"  S_FMT result: {actual_w}x{actual_h} fmt=0x{pf:08x}({fourcc!r}) bpl={fmt.fmt.pix.bytesperline} sizeimage={fmt.fmt.pix.sizeimage}")
+    buffers, count = _setup_buffers(fd, nbuf)
+    print(f"  REQBUFS allocated: {count} buffers")
     fcntl.ioctl(fd, v4l2.VIDIOC_STREAMON, v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
     return fd, buffers, (actual_w, actual_h)
 
