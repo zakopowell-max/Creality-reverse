@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
 Live depth feed from Creality CR-Scan Otter — GTK3Agg display (Wayland-safe).
-Press Q or close the window to quit.
 
-Usage: python3 live_feed.py [--max-depth METRES]
+Usage:
+  python3 live_feed.py              # 2D depth image only (fastest)
+  python3 live_feed.py --3d         # depth image + live 3D point cloud
+  python3 live_feed.py --snapshot   # capture one PLY then view it via Open3D web
+  python3 live_feed.py --max-depth 1.5
+
+Press Q / close window to quit.
 """
 import v4l2, fcntl, mmap, select, time, argparse, sys
 import numpy as np
 import matplotlib
 matplotlib.use('GTK3Agg')
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D   # noqa: F401 — registers 3d projection
 
 DEPTH_DEV = '/dev/video2'
 DEPTH_W, DEPTH_H = 640, 400
 DEPTH_SCALE = 0.005   # m/unit, calibrated 2026-04-03
+DEPTH_FX, DEPTH_FY = 620.0, 620.0
 NBUF = 4
 
 
@@ -64,6 +71,8 @@ def _streamoff(fd):
                 v4l2.v4l2_buf_type(v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE))
 
 
+# ── Device lifecycle ─────────────────────────────────────────────────────────
+
 def prime_device():
     print("Priming scanner...", end=' ', flush=True)
     fd = open(DEPTH_DEV, 'rb+', buffering=0)
@@ -101,7 +110,9 @@ def close_stream(fd, bufs):
     fd.close()
 
 
-def decode_y10(raw, w, h):
+# ── Data processing ──────────────────────────────────────────────────────────
+
+def decode_y10(raw, w=DEPTH_W, h=DEPTH_H):
     arr = np.frombuffer(raw, dtype=np.uint8).astype(np.uint16)
     n = len(arr) // 5
     b = arr[:n*5].reshape(n, 5)
@@ -113,14 +124,73 @@ def decode_y10(raw, w, h):
     return px[:w * h].reshape(h, w)
 
 
+def depth_to_points(depth_img, min_m=0.05, max_m=5.0, max_pts=6000):
+    cx, cy = DEPTH_W / 2, DEPTH_H / 2
+    h, w = depth_img.shape
+    ys, xs = np.mgrid[0:h, 0:w]
+    Z = depth_img.astype(np.float32) * DEPTH_SCALE
+    valid = (Z > min_m) & (Z < max_m)
+    X = (xs[valid] - cx) * Z[valid] / DEPTH_FX
+    Y = (ys[valid] - cy) * Z[valid] / DEPTH_FY
+    pts = np.column_stack([X, Y, Z[valid]])
+    # Subsample for display speed
+    if len(pts) > max_pts:
+        idx = np.random.choice(len(pts), max_pts, replace=False)
+        pts = pts[idx]
+    return pts
+
+
+# ── Snapshot mode ────────────────────────────────────────────────────────────
+
+def do_snapshot(max_m):
+    """Capture one clean frame, save PLY, view via Open3D draw_plotly."""
+    from capture_and_cloud import (capture_frames, decode_y10_packed,
+                                   depth_to_pointcloud, save_ply)
+    import open3d as o3d
+
+    fd, bufs = open_stream()
+    raw_frames = capture_frames(fd, bufs, 5)
+    close_stream(fd, bufs)
+
+    depth_sum = sum(decode_y10_packed(r, DEPTH_W, DEPTH_H).astype(np.float32)
+                    for r in raw_frames) / len(raw_frames)
+    pts = depth_to_pointcloud(depth_sum, DEPTH_FX, DEPTH_FY,
+                              DEPTH_W/2, DEPTH_H/2, DEPTH_SCALE,
+                              min_depth=0.05, max_depth=max_m)
+    ply_path = '/tmp/snapshot.ply'
+    save_ply(pts, ply_path)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    z = pts[:, 2]
+    t = np.clip((z - 0.05) / (max_m - 0.05), 0, 1)
+    import matplotlib.cm as cmx
+    colours = cmx.plasma(t)[:, :3]
+    pcd.colors = o3d.utility.Vector3dVector(colours)
+    print(f"Saved {len(pts)} points to {ply_path}")
+    print("Opening in browser (close tab when done)...")
+    o3d.visualization.draw_plotly([pcd])
+
+
+# ── Main live loop ────────────────────────────────────────────────────────────
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--3d', action='store_true', dest='show3d',
+                        help='Show live 3D point cloud alongside depth image')
+    parser.add_argument('--snapshot', action='store_true',
+                        help='Capture one frame, save PLY, view in browser')
     parser.add_argument('--max-depth', type=float, default=2.0,
                         help='Max depth for colour scale (metres, default 2.0)')
     args = parser.parse_args()
     max_raw = int(args.max_depth / DEPTH_SCALE)
 
     prime_device()
+
+    if args.snapshot:
+        do_snapshot(args.max_depth)
+        return
+
     fd, bufs = open_stream()
 
     # Skip warm-up empty frames
@@ -140,48 +210,56 @@ def main():
             break
         fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
         skipped += 1
-    print(f"Skipped {skipped} warm-up frames. Live feed starting — close window or Ctrl-C to quit.")
+    print(f"Skipped {skipped} warm-up frames. Live feed — close window or Ctrl-C to quit.")
 
-    # Set up matplotlib figure
+    # ── Figure layout ────────────────────────────────────────────────────────
     plt.ion()
-    fig, ax = plt.subplots(figsize=(10, 6.25))
-    fig.patch.set_facecolor('#111')
-    ax.set_facecolor('#111')
-    ax.axis('off')
+    if args.show3d:
+        fig = plt.figure(figsize=(14, 5), facecolor='#111')
+        ax2d = fig.add_subplot(1, 2, 1)
+        ax3d = fig.add_subplot(1, 2, 2, projection='3d')
+        ax3d.set_facecolor('#111')
+        ax3d.set_xlabel('X', color='#888', fontsize=8)
+        ax3d.set_ylabel('Z (depth)', color='#888', fontsize=8)
+        ax3d.set_zlabel('Y', color='#888', fontsize=8)
+        ax3d.tick_params(colors='#555', labelsize=7)
+        for pane in (ax3d.xaxis.pane, ax3d.yaxis.pane, ax3d.zaxis.pane):
+            pane.fill = False
+            pane.set_edgecolor('#333')
+        scat3d = None
+    else:
+        fig, ax2d = plt.subplots(figsize=(10, 6.25))
+        fig.patch.set_facecolor('#111')
 
-    # Blank initial frame
-    display_img = np.zeros((DEPTH_H, DEPTH_W), dtype=np.float32)
-    im = ax.imshow(display_img, cmap='plasma', vmin=0, vmax=max_raw,
-                   interpolation='nearest', aspect='auto')
-    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    ax2d.set_facecolor('#111')
+    ax2d.axis('off')
+
+    blank = np.zeros((DEPTH_H, DEPTH_W), dtype=np.float32)
+    im = ax2d.imshow(blank, cmap='plasma', vmin=0, vmax=max_raw,
+                     interpolation='nearest', aspect='auto')
+    cbar = fig.colorbar(im, ax=ax2d, fraction=0.025, pad=0.01)
     cbar.set_label('Depth (m)', color='white')
-    cbar.ax.yaxis.set_tick_params(color='white')
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
-    # Colourbar ticks in metres
     tick_vals = np.linspace(0, max_raw, 6)
     cbar.set_ticks(tick_vals)
     cbar.set_ticklabels([f'{v*DEPTH_SCALE:.1f}m' for v in tick_vals])
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
 
-    title = ax.set_title('Depth feed — starting...', color='white', fontsize=11)
+    title = ax2d.set_title('Starting...', color='white', fontsize=10)
     plt.tight_layout(pad=0.5)
     fig.canvas.draw()
     fig.canvas.flush_events()
 
-    # Blit background for speed
-    bg = fig.canvas.copy_from_bbox(fig.bbox)
+    running = [True]
+    fig.canvas.mpl_connect('close_event', lambda _: running.__setitem__(0, False))
 
+    # For 3D: only redraw every N depth frames (matplotlib 3D is slow)
+    cloud_every = 5
+    cloud_counter = 0
     frame_count = 0
     fps_t = time.time()
-    running = True
-
-    def on_close(_):
-        nonlocal running
-        running = False
-
-    fig.canvas.mpl_connect('close_event', on_close)
 
     try:
-        while running:
+        while running[0]:
             r, _, _ = select.select([fd], [], [], 0.1)
             if not r:
                 fig.canvas.flush_events()
@@ -200,15 +278,13 @@ def main():
             raw = bytes(bufs[b.index][:320000])
             fcntl.ioctl(fd, v4l2.VIDIOC_QBUF, b)
 
-            depth = decode_y10(raw, DEPTH_W, DEPTH_H).astype(np.float32)
-            # Zero out pixels above max range (treat as no-return)
+            depth = decode_y10(raw).astype(np.float32)
             depth[depth > max_raw] = 0
             frame_count += 1
+            cloud_counter += 1
 
-            # Update display via blitting
+            # ── 2D depth update ──────────────────────────────────────────────
             im.set_data(depth)
-            fig.canvas.restore_region(bg)
-            ax.draw_artist(im)
 
             now = time.time()
             if now - fps_t >= 1.5:
@@ -217,16 +293,35 @@ def main():
                 fps_t = now
                 cy = slice(DEPTH_H//2-10, DEPTH_H//2+10)
                 cx = slice(DEPTH_W//2-16, DEPTH_W//2+16)
-                center_raw = depth[cy, cx]
-                cnz = center_raw[center_raw > 0]
-                if len(cnz):
-                    cdist = f"{cnz.mean()*DEPTH_SCALE*100:.0f}cm"
-                else:
-                    cdist = "no-return"
-                title.set_text(f'{fps:.1f} fps  |  centre {cdist}  |  close window to quit')
-                ax.draw_artist(title)
+                cnz = depth[cy, cx]
+                cnz = cnz[cnz > 0]
+                cdist = f"{cnz.mean()*DEPTH_SCALE*100:.0f}cm" if len(cnz) else "no-return"
+                mode = " (+3D)" if args.show3d else ""
+                title.set_text(f'{fps:.1f} fps{mode}  |  centre {cdist}  |  close to quit')
 
-            fig.canvas.blit(fig.bbox)
+            # ── 3D point cloud update (every N frames) ───────────────────────
+            if args.show3d and cloud_counter >= cloud_every:
+                cloud_counter = 0
+                pts = depth_to_points(depth, max_m=args.max_depth)
+                if len(pts):
+                    if scat3d is not None:
+                        scat3d.remove()
+                    z = pts[:, 2]
+                    t = np.clip((z - 0.05) / (args.max_depth - 0.05), 0, 1)
+                    import matplotlib.cm as cmx
+                    colours = cmx.plasma(t)
+                    # matplotlib 3D: X=left/right, Y=depth, Z=up/down
+                    scat3d = ax3d.scatter(pts[:,0], pts[:,2], -pts[:,1],
+                                         c=colours, s=0.5, alpha=0.6,
+                                         depthshade=False)
+                    ax3d.set_xlim(-1, 1)
+                    ax3d.set_ylim(0, args.max_depth)
+                    ax3d.set_zlim(-0.5, 0.5)
+                fig.canvas.draw()
+            else:
+                # Fast blit for 2D-only frames
+                fig.canvas.draw_idle()
+
             fig.canvas.flush_events()
 
     except KeyboardInterrupt:
