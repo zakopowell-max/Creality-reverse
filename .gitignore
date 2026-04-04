@@ -16,3 +16,4 @@ log/
 *.pgm
 *.png
 /tmp/
+__pycache__/

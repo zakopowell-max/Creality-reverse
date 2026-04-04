@@ -5,8 +5,9 @@ Hypothesis: scanner is a 'request-frame' device needing a streaming restart per 
 """
 import v4l2, fcntl, mmap, select, struct, time
 import numpy as np
+from devices import find_otter_devices
 
-DEPTH_DEV = '/dev/video2'
+DEPTH_DEV, _, _ = find_otter_devices()
 DEPTH_W, DEPTH_H = 640, 400
 NBUF = 4
 

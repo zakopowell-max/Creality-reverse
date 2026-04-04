@@ -21,17 +21,18 @@ import matplotlib
 matplotlib.use('GTK3Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D   # noqa: F401 — registers 3d projection
+from devices import find_otter_devices
 
-DEPTH_DEV = '/dev/video2'
+DEPTH_DEV, IR_DEV, COLOUR_DEV = find_otter_devices()
+
 DEPTH_W, DEPTH_H = 640, 400
 DEPTH_SCALE = 0.005   # m/unit, calibrated 2026-04-03
 DEPTH_FX, DEPTH_FY = 620.0, 620.0
 
-IR_DEV = '/dev/video4'
 IR_W, IR_H = 1280, 800
 IR_FRAME_SIZE = IR_W * IR_H * 10 // 8  # 1280000 bytes
 
-COLOUR_DEV = '/dev/video6'
+
 COLOUR_W, COLOUR_H = 640, 480
 COLOUR_FRAME_SIZE = COLOUR_W * COLOUR_H * 2  # YUYV: 2 bytes/pixel
 # Colour is 640x480, depth is 640x400 — crop 40px top+bottom to align vertically
@@ -176,7 +177,11 @@ def decode_yuyv(raw, w=COLOUR_W, h=COLOUR_H):
 
 
 def open_colour_stream():
-    """Colour camera needs no prime — it's a standard RGB sensor."""
+    """Open colour stream with boosted gain for indoor/dim environments."""
+    import subprocess
+    subprocess.run(['v4l2-ctl', '-d', COLOUR_DEV,
+                    '-c', 'gain=255', '-c', 'brightness=200'],
+                   capture_output=True)
     fd = open(COLOUR_DEV, 'rb+', buffering=0)
     fmt = v4l2.v4l2_format()
     fmt.type = v4l2.V4L2_BUF_TYPE_VIDEO_CAPTURE

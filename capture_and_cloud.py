@@ -9,9 +9,9 @@ Depth scale calibrated 2026-04-03:
 """
 import v4l2, fcntl, mmap, select, struct, sys, argparse, time
 import numpy as np
+from devices import find_otter_devices
 
-DEPTH_DEV = '/dev/video2'
-COLOR_DEV = '/dev/video6'
+DEPTH_DEV, _, COLOR_DEV = find_otter_devices()
 
 DEPTH_W, DEPTH_H = 640, 400
 DEPTH_FX = 620.0

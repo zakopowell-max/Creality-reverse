@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Capture one IR frame from /dev/video4 and save as PNG."""
+"""Capture one IR frame from the Creality CR-Scan Otter and save as PNG."""
 import v4l2, fcntl, mmap, select, time
 import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from devices import find_otter_devices
 
-IR_DEV = '/dev/video4'
+_, IR_DEV, _ = find_otter_devices()
 IR_W, IR_H = 1280, 800
 FRAME_SIZE = IR_W * IR_H * 10 // 8  # 1280000 bytes packed Y10
 
